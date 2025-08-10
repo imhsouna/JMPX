@@ -439,15 +439,20 @@ def generate_tone(duration_s: float, fs: int, freq_hz: float = 1000.0, level_db:
 
 
 class SystemLoopbackCapture:
-    """Capture system audio via WASAPI loopback on Windows, or default input elsewhere."""
+    """Capture system audio via WASAPI loopback on Windows, or default input elsewhere.
+    Auto-detects device channels and samplerate, and resamples to target fs.
+    """
 
     def __init__(self, fs: int, device: Optional[int] = None, channels: int = 2, blocksize: int = 4096):
-        self.fs = fs
+        self.fs = fs  # desired processing/output fs
         self.device = device
-        self.channels = channels
+        self.req_channels = channels
         self.blocksize = blocksize
         self.q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=16)
         self._stream: Optional[sd.InputStream] = None
+        self.captured_fs: Optional[float] = None
+        self.captured_channels: int = channels
+        self._hold: Optional[np.ndarray] = None  # buffer at captured_fs
 
     def start(self):
         extra = None
@@ -456,41 +461,106 @@ class SystemLoopbackCapture:
                 extra = sd.WasapiSettings(loopback=True)
             except Exception:
                 extra = None
+        # Probe device info
+        dev_info = None
+        try:
+            if self.device is not None:
+                dev_info = sd.query_devices(self.device)
+        except Exception:
+            dev_info = None
+        # Decide channels for loopback: use output channels if available
+        ch = self.req_channels
+        if dev_info is not None:
+            out_ch = int(dev_info.get('max_output_channels', 0) or 0)
+            if out_ch > 0:
+                ch = min(max(1, out_ch), 2)
+        # Decide samplerate: try desired fs first, else device default
+        sr_try = [self.fs]
+        if dev_info is not None:
+            try:
+                sr_def = float(dev_info.get('default_samplerate') or 0)
+                if sr_def and int(sr_def) != self.fs:
+                    sr_try.append(int(sr_def))
+            except Exception:
+                pass
+        opened = False
+        err_last = None
+
         def cb(indata, frames, time_info, status):
             try:
-                # Ensure stereo
                 x = indata.copy()
                 if x.ndim == 1:
                     x = np.stack([x, x], axis=1)
                 elif x.shape[1] == 1:
                     x = np.repeat(x, 2, axis=1)
-                # Resample if not expected blocksize
                 self.q.put_nowait(x.astype(np.float32))
             except queue.Full:
                 pass
-        self._stream = sd.InputStream(
-            samplerate=self.fs,
-            device=self.device,
-            channels=self.channels,
-            dtype='float32',
-            callback=cb,
-            blocksize=self.blocksize,
-            extra_settings=extra,
-        )
-        self._stream.start()
+
+        for sr in sr_try:
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=sr,
+                    device=self.device,
+                    channels=ch,
+                    dtype='float32',
+                    callback=cb,
+                    blocksize=self.blocksize,
+                    extra_settings=extra,
+                )
+                self._stream.start()
+                self.captured_fs = float(sr)
+                self.captured_channels = ch
+                opened = True
+                break
+            except Exception as e:
+                err_last = e
+                self._stream = None
+        if not opened:
+            raise RuntimeError(f"Failed to open loopback input: {err_last}")
 
     def read(self, frames: int) -> np.ndarray:
-        try:
-            buf = self.q.get(timeout=1.0)
-        except queue.Empty:
+        """Return 'frames' at target fs, stereo float32."""
+        if self.captured_fs is None:
             return np.zeros((frames, 2), dtype=np.float32)
-        # If frames mismatch, pad/trim
-        if buf.shape[0] < frames:
-            pad = np.zeros((frames - buf.shape[0], buf.shape[1]), dtype=buf.dtype)
-            buf = np.vstack([buf, pad])
-        elif buf.shape[0] > frames:
-            buf = buf[:frames, :]
-        return buf
+        # Accumulate enough source samples
+        need_src = int(round(frames * self.captured_fs / float(self.fs)))
+        if need_src <= 0:
+            need_src = 1
+        if self._hold is None:
+            self._hold = np.zeros((0, 2), dtype=np.float32)
+        while self._hold.shape[0] < need_src:
+            try:
+                buf = self.q.get(timeout=1.0)
+            except queue.Empty:
+                buf = np.zeros((min(self.blocksize, need_src), 2), dtype=np.float32)
+            # Ensure stereo
+            if buf.ndim == 1:
+                buf = np.stack([buf, buf], axis=1)
+            elif buf.shape[1] == 1:
+                buf = np.repeat(buf, 2, axis=1)
+            self._hold = np.vstack([self._hold, buf])
+        src = self._hold[:need_src, :]
+        self._hold = self._hold[need_src:, :]
+        if int(self.captured_fs) == int(self.fs):
+            # Same rate: just match frame count
+            if src.shape[0] < frames:
+                pad = np.zeros((frames - src.shape[0], 2), dtype=np.float32)
+                src = np.vstack([src, pad])
+            elif src.shape[0] > frames:
+                src = src[:frames, :]
+            return src.astype(np.float32)
+        # Resample to exact frames
+        left = safe_resample_poly(src[:, 0], up=self.fs, down=int(self.captured_fs))
+        right = safe_resample_poly(src[:, 1], up=self.fs, down=int(self.captured_fs))
+        y = np.stack([left, right], axis=1)
+        # Adjust length
+        if y.shape[0] < frames:
+            pad = np.zeros((frames - y.shape[0], 2), dtype=np.float32)
+            y = np.vstack([y, pad])
+        elif y.shape[0] > frames:
+            y = y[:frames, :]
+        return y.astype(np.float32)
 
     def stop(self):
         if self._stream is not None:
@@ -501,6 +571,7 @@ class SystemLoopbackCapture:
                 self._stream = None
         with self.q.mutex:
             self.q.queue.clear()
+        self._hold = None
 
 
 # =============================
