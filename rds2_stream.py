@@ -11,6 +11,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from scipy.signal import resample_poly, firwin, lfilter
+from PIL import Image
 
 
 # =============================
@@ -29,6 +30,11 @@ RDS_BITRATE = 1187.5
 DEFAULT_PILOT_LEVEL = 0.08
 DEFAULT_RDS_LEVEL = 0.03
 DEFAULT_RDS2_LEVEL = 0.01
+
+# RDS2 experimental logo framing
+RDS2_LOGO_MAX_W = 64
+RDS2_LOGO_MAX_H = 32
+RDS2_LOGO_MAGIC = 0xA7  # arbitrary marker for our simple framing
 
 # RDS CRC generator polynomial g(x) = x^10 + x^8 + x^7 + x^5 + x^4 + x^3 + 1
 # Polynomial value 0x5B9 (binary 101 1011 1001). Widely used in reference implementations.
@@ -183,8 +189,33 @@ class RdsBitstreamGenerator:
         self.cfg = cfg
         self.ps_index = 0
         self.rt_index = 0
+        self.logo_frame: Optional[np.ndarray] = None
+        self.logo_idx = 0
+
+    def set_logo_bits(self, bits: Optional[np.ndarray]):
+        self.logo_frame = bits
+        self.logo_idx = 0
+
+    def _next_logo_chunk(self, max_bits: int) -> Optional[np.ndarray]:
+        if self.logo_frame is None or len(self.logo_frame) == 0:
+            return None
+        n = min(max_bits, len(self.logo_frame) - self.logo_idx)
+        if n <= 0:
+            # loop
+            self.logo_idx = 0
+            n = min(max_bits, len(self.logo_frame))
+        chunk = self.logo_frame[self.logo_idx:self.logo_idx + n]
+        self.logo_idx += n
+        return chunk
 
     def next_group_bits(self) -> np.ndarray:
+        # Insert small logo chunk periodically to keep presence in RDS2 sidebands
+        if (self.ps_index % 5) == 0 and self.logo_frame is not None:
+            # Return a slice of logo bits directly, not an RDS group
+            chunk = self._next_logo_chunk(104)  # approx group size
+            if chunk is not None:
+                return chunk
+
         # Alternate two 0A per one 2A group to keep PS fresh
         if (self.ps_index % 3) != 2:
             bits = build_group_0a(self.cfg, self.ps_index & 0x3)
@@ -390,10 +421,11 @@ def _prepare_rds_bits(pi: int, ps: str, rt: str, seconds: float, fs: int) -> np.
 @click.option("--rds-level", type=float, default=DEFAULT_RDS_LEVEL, show_default=True, help="RDS level (linear)")
 @click.option("--rds2", is_flag=True, default=False, help="Enable experimental RDS2 sidebands")
 @click.option("--rds2-level", type=float, default=DEFAULT_RDS2_LEVEL, show_default=True, help="RDS2 per-subcarrier level (linear)")
+@click.option("--logo", type=click.Path(exists=True, dir_okay=False), default=None, help="Path to station logo image (png/jpg)")
 @click.option("--level-mpx", type=float, default=0.0, show_default=True, help="Overall MPX gain (dB)")
 @click.option("--blocksize", type=int, default=4096, show_default=True, help="Block size for streaming frames")
 def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, device: Optional[int], pi: str, ps: str,
-         rt: str, pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, level_mpx: float, blocksize: int):
+         rt: str, pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, logo: Optional[str], level_mpx: float, blocksize: int):
     """Play composite MPX with RDS/RDS2 to a sound device."""
     if input is None and tone is None:
         raise click.UsageError("Provide --input or --tone")
@@ -408,7 +440,13 @@ def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, 
         stereo = generate_tone(duration_s=duration, fs=fs, freq_hz=tone or 1000.0)
 
     total_seconds = stereo.shape[0] / fs
-    rds_bits = _prepare_rds_bits(pi=int(pi, 16), ps=ps, rt=rt, seconds=total_seconds, fs=fs)
+    cfg = RdsConfig(pi_code=int(pi, 16), program_service_name=ps or "", radiotext=rt or "")
+    gen = RdsBitstreamGenerator(cfg)
+
+    if rds2 and logo:
+        gen.set_logo_bits(load_logo_bits(logo))
+
+    rds_bits = gen.generate_bits(int(math.ceil(total_seconds * RDS_BITRATE * 1.1)))
 
     # Streaming in blocks
     q_out: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
@@ -424,7 +462,7 @@ def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, 
             bits_needed = int(math.ceil((end - idx) / fs * RDS_BITRATE)) + 208
             if len(rds_bits) < bits_needed:
                 # extend
-                extra = _prepare_rds_bits(pi=int(pi, 16), ps=ps, rt=rt, seconds=2.0, fs=fs)
+                extra = gen.generate_bits(int(math.ceil(2.0 * RDS_BITRATE)))
                 rds_bits[:] = np.concatenate([rds_bits, extra])
             bits_block = rds_bits[:bits_needed]
             rds_bits[:] = rds_bits[bits_needed:]
@@ -484,9 +522,10 @@ def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, 
 @click.option("--rds-level", type=float, default=DEFAULT_RDS_LEVEL, show_default=True, help="RDS level (linear)")
 @click.option("--rds2", is_flag=True, default=False, help="Enable experimental RDS2 sidebands")
 @click.option("--rds2-level", type=float, default=DEFAULT_RDS2_LEVEL, show_default=True, help="RDS2 per-subcarrier level (linear)")
+@click.option("--logo", type=click.Path(exists=True, dir_okay=False), default=None, help="Path to station logo image (png/jpg)")
 @click.option("--level-mpx", type=float, default=0.0, show_default=True, help="Overall MPX gain (dB)")
 def tofile(output: str, input: Optional[str], tone: Optional[float], duration: float, fs: int, pi: str, ps: str, rt: str,
-           pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, level_mpx: float):
+           pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, logo: Optional[str], level_mpx: float):
     """Render composite MPX with RDS/RDS2 to a WAV file (mono)."""
     if input is None and tone is None:
         raise click.UsageError("Provide --input or --tone")
@@ -497,7 +536,14 @@ def tofile(output: str, input: Optional[str], tone: Optional[float], duration: f
         stereo = generate_tone(duration_s=duration, fs=fs, freq_hz=tone or 1000.0)
 
     total_seconds = stereo.shape[0] / fs
-    rds_bits = _prepare_rds_bits(pi=int(pi, 16), ps=ps, rt=rt, seconds=total_seconds, fs=fs)
+
+    cfg = RdsConfig(pi_code=int(pi, 16), program_service_name=ps or "", radiotext=rt or "")
+    gen = RdsBitstreamGenerator(cfg)
+
+    if rds2 and logo:
+        gen.set_logo_bits(load_logo_bits(logo))
+
+    rds_bits = gen.generate_bits(int(math.ceil(total_seconds * RDS_BITRATE * 1.1)))
 
     mpx = make_mpx(
         left=stereo[:, 0],
@@ -513,6 +559,64 @@ def tofile(output: str, input: Optional[str], tone: Optional[float], duration: f
 
     sf.write(output, mpx, samplerate=fs, subtype='PCM_24')
     click.echo(f"Wrote {output} ({len(mpx)/fs:.2f}s at {fs} Hz)")
+
+
+def load_logo_bits(path: str) -> np.ndarray:
+    """Load an image and pack as a simple framed monochrome bitstream for RDS2.
+    Frame format (repeating):
+    - 8 bits magic (0xA7)
+    - 7 bits width (1..64)
+    - 6 bits height (1..32)
+    - 3 bits reserved (0)
+    - width*height bits, row-major, 1=white, 0=black
+    - 16 bits simple checksum (sum of payload bytes & 0xFFFF)
+    This is not an ETSI RDS2 logo standard; it's a practical, receiver-agnostic payload carried on RDS2 BPSK.
+    """
+    img = Image.open(path).convert('L')
+    w = min(RDS2_LOGO_MAX_W, max(1, img.width))
+    h = min(RDS2_LOGO_MAX_H, max(1, img.height))
+    if img.width != w or img.height != h:
+        img = img.resize((w, h), Image.LANCZOS)
+    arr = np.array(img)
+    # Binarize with Otsu-like threshold (simple mean)
+    thr = float(arr.mean())
+    bits = (arr >= thr).astype(np.uint8)
+
+    # Header bits
+    header = []
+    def put(val: int, nbits: int):
+        for i in range(nbits - 1, -1, -1):
+            header.append((val >> i) & 1)
+
+    put(RDS2_LOGO_MAGIC, 8)
+    put(w, 7)
+    put(h, 6)
+    put(0, 3)
+
+    payload_bits = bits.flatten().tolist()
+
+    # Compute checksum over payload bytes
+    # Pack payload bits into bytes MSB-first
+    payload_bytes = []
+    acc = 0
+    cnt = 0
+    for b in payload_bits:
+        acc = (acc << 1) | b
+        cnt += 1
+        if cnt == 8:
+            payload_bytes.append(acc)
+            acc = 0
+            cnt = 0
+    if cnt != 0:
+        acc <<= (8 - cnt)
+        payload_bytes.append(acc)
+
+    checksum = sum(payload_bytes) & 0xFFFF
+    footer = []
+    put(checksum, 16)
+
+    all_bits = np.array(header + payload_bits + footer, dtype=np.uint8)
+    return all_bits
 
 
 if __name__ == "__main__":
