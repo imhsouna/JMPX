@@ -241,6 +241,7 @@ class RdsBitstreamGenerator:
 # RDS BPSK waveform generation
 # =============================
 
+
 def differential_encode(bits: np.ndarray) -> np.ndarray:
     """Differential encoding for RDS: 1 -> phase invert, 0 -> no change. Output +/-1."""
     out = np.empty_like(bits, dtype=np.int8)
@@ -304,6 +305,7 @@ def bpsk_subcarrier(bits: np.ndarray, fs: float, subcarrier_hz: float, bitrate: 
 # =============================
 # MPX generation
 # =============================
+
 
 def lowpass_stereo(audio: np.ndarray, fs: float, cutoff_hz: float = 15000.0) -> np.ndarray:
     numtaps = 513
@@ -380,6 +382,30 @@ def generate_tone(duration_s: float, fs: int, freq_hz: float = 1000.0, level_db:
     return np.stack([left, right], axis=1).astype(np.float32)
 
 
+def find_device_index_by_name(name_query: str, is_output: Optional[bool] = None) -> Optional[int]:
+    """Find a device index whose name contains the given query (case-insensitive).
+    If is_output is True, restrict to output-capable devices. If False, input-capable. If None, any.
+    Prefer exact match if multiple, otherwise first partial match.
+    """
+    devices = sd.query_devices()
+    name_lc = name_query.lower()
+    candidates: List[Tuple[int, dict]] = []
+    for idx, dev in enumerate(devices):
+        if is_output is True and dev.get("max_output_channels", 0) <= 0:
+            continue
+        if is_output is False and dev.get("max_input_channels", 0) <= 0:
+            continue
+        if name_lc in dev.get("name", "").lower():
+            candidates.append((idx, dev))
+    if not candidates:
+        return None
+    # Exact match preferred
+    for idx, dev in candidates:
+        if dev.get("name", "").lower() == name_lc:
+            return idx
+    return candidates[0][0]
+
+
 # =============================
 # CLI
 # =============================
@@ -395,10 +421,9 @@ def devices(fs: int):
     """List audio output devices."""
     sd.default.samplerate = fs
     info = sd.query_devices()
-    click.echo("Index | Name | Max output channels")
+    click.echo("Index | Name | Max output channels | Max input channels")
     for idx, dev in enumerate(info):
-        if dev.get("max_output_channels", 0) > 0:
-            click.echo(f"{idx:5d} | {dev['name']} | {dev['max_output_channels']}")
+        click.echo(f"{idx:5d} | {dev['name']} | {dev.get('max_output_channels', 0)} | {dev.get('max_input_channels', 0)}")
 
 
 def _prepare_rds_bits(pi: int, ps: str, rt: str, seconds: float, fs: int) -> np.ndarray:
@@ -414,6 +439,9 @@ def _prepare_rds_bits(pi: int, ps: str, rt: str, seconds: float, fs: int) -> np.
 @click.option("--duration", type=float, default=30.0, show_default=True, help="Duration if using tone (s)")
 @click.option("--fs", type=int, default=192000, show_default=True, help="Sample rate for MPX output")
 @click.option("--device", type=int, default=None, help="Sounddevice output index")
+@click.option("--device-name", type=str, default=None, help="Output device name (substring match)")
+@click.option("--system-audio", is_flag=True, default=False, help="Capture system audio via WASAPI loopback (Windows)")
+@click.option("--capture-name", type=str, default=None, help="Playback or input device name to capture from")
 @click.option("--pi", type=str, default="0x1234", show_default=True, help="PI code, hex like 0x1234")
 @click.option("--ps", type=str, default="TESTFM", show_default=True, help="Program Service name (8 chars)")
 @click.option("--rt", type=str, default="", help="Radiotext (up to 64 chars)")
@@ -424,27 +452,148 @@ def _prepare_rds_bits(pi: int, ps: str, rt: str, seconds: float, fs: int) -> np.
 @click.option("--logo", type=click.Path(exists=True, dir_okay=False), default=None, help="Path to station logo image (png/jpg)")
 @click.option("--level-mpx", type=float, default=0.0, show_default=True, help="Overall MPX gain (dB)")
 @click.option("--blocksize", type=int, default=4096, show_default=True, help="Block size for streaming frames")
-def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, device: Optional[int], pi: str, ps: str,
+def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, device: Optional[int], device_name: Optional[str],
+         system_audio: bool, capture_name: Optional[str], pi: str, ps: str,
          rt: str, pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, logo: Optional[str], level_mpx: float, blocksize: int):
-    """Play composite MPX with RDS/RDS2 to a sound device."""
-    if input is None and tone is None:
-        raise click.UsageError("Provide --input or --tone")
+    """Play composite MPX with RDS/RDS2 to a sound device.
+
+    Modes:
+    - File/tone playback (default): provide --input or --tone
+    - Capture: use --system-audio (Windows WASAPI loopback) and optionally --capture-name to pick playback device to loop back,
+      or omit --system-audio and provide --capture-name to use a regular input device (e.g., microphone or VAC input).
+    """
+    if input is None and tone is None and not (system_audio or capture_name):
+        raise click.UsageError("Provide --input or --tone, or use --system-audio/--capture-name for live capture")
 
     sd.default.samplerate = fs
-    if device is not None:
-        sd.default.device = device
 
+    # Resolve output device by name if provided
+    if device_name and device is None:
+        idx = find_device_index_by_name(device_name, is_output=True)
+        if idx is None:
+            raise click.UsageError(f"Output device not found by name: {device_name}")
+        device = idx
+    if device is not None:
+        sd.default.device = (sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else None, device)
+
+    # Prepare RDS generator
+    cfg = RdsConfig(pi_code=int(pi, 16), program_service_name=ps or "", radiotext=rt or "")
+    gen = RdsBitstreamGenerator(cfg)
+    if rds2 and logo:
+        gen.set_logo_bits(load_logo_bits(logo))
+
+    gain = db_to_linear(level_mpx)
+
+    # Capture mode
+    if system_audio or capture_name:
+        # Determine capture device index and extra settings
+        cap_idx: Optional[int] = None
+        extra_settings = None
+
+        if system_audio:
+            # Loopback capture from a playback device (WASAPI only)
+            try:
+                extra_settings = sd.WasapiSettings(loopback=True)
+            except Exception:
+                raise click.UsageError("--system-audio requires Windows WASAPI (sounddevice.WasapiSettings)")
+            if capture_name:
+                cap_idx = find_device_index_by_name(capture_name, is_output=True)
+                if cap_idx is None:
+                    raise click.UsageError(f"Playback device for loopback not found: {capture_name}")
+            else:
+                # Default system playback device
+                try:
+                    cap_idx = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) else sd.query_devices(kind='output')['index']
+                except Exception:
+                    cap_idx = None
+        else:
+            # Regular input device capture
+            if capture_name:
+                cap_idx = find_device_index_by_name(capture_name, is_output=False)
+                if cap_idx is None:
+                    raise click.UsageError(f"Input device not found: {capture_name}")
+
+        q_in: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=16)
+        q_out: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(maxsize=16)
+
+        def in_callback(indata, frames, time_info, status):
+            try:
+                # Ensure stereo
+                data = indata if indata.shape[1] == 2 else np.repeat(indata, 2, axis=1)
+                q_in.put_nowait(data.copy())
+            except queue.Full:
+                pass
+
+        def worker_stop_condition(start_time: float) -> bool:
+            if tone is not None or input is not None:
+                return True  # not used in capture mode
+            if duration and duration > 0:
+                return (time.time() - start_time) >= duration
+            return False
+
+        def worker():
+            start_time = time.time()
+            while True:
+                if worker_stop_condition(start_time):
+                    q_out.put(None)
+                    return
+                try:
+                    stereo_block = q_in.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                # Bits needed for this block
+                frames = stereo_block.shape[0]
+                bits_needed = int(math.ceil(frames / fs * RDS_BITRATE)) + 208
+                bits_block = gen.generate_bits(bits_needed)
+                mpx = make_mpx(
+                    left=stereo_block[:, 0],
+                    right=stereo_block[:, 1],
+                    fs=fs,
+                    pilot_level=pilot_level,
+                    rds_level=rds_level,
+                    rds2_level=rds2_level,
+                    rds_bits=bits_block,
+                    enable_rds2=rds2,
+                )
+                mpx *= gain
+                q_out.put(mpx, block=True)
+
+        def out_callback(outdata, frames, time_info, status):
+            try:
+                chunk = q_out.get(timeout=1.0)
+            except queue.Empty:
+                outdata[:] = 0
+                return
+            if chunk is None:
+                raise sd.CallbackStop
+            if outdata.shape[1] == 1:
+                outdata[:, 0] = chunk[:frames] if len(chunk) >= frames else np.pad(chunk, (0, frames - len(chunk)))
+            else:
+                mono = chunk[:frames] if len(chunk) >= frames else np.pad(chunk, (0, frames - len(chunk)))
+                outdata[:, 0] = mono
+                outdata[:, 1] = mono
+
+        import threading
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+
+        with sd.InputStream(device=cap_idx, channels=2, dtype='float32', callback=in_callback,
+                             blocksize=blocksize, samplerate=fs, extra_settings=extra_settings), \
+             sd.OutputStream(channels=1, dtype='float32', callback=out_callback, blocksize=blocksize, samplerate=fs):
+            try:
+                while worker_thread.is_alive():
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                pass
+        return
+
+    # File/tone playback mode (original)
     if input:
         stereo, _ = read_audio_file(input, target_fs=fs)
     else:
         stereo = generate_tone(duration_s=duration, fs=fs, freq_hz=tone or 1000.0)
 
     total_seconds = stereo.shape[0] / fs
-    cfg = RdsConfig(pi_code=int(pi, 16), program_service_name=ps or "", radiotext=rt or "")
-    gen = RdsBitstreamGenerator(cfg)
-
-    if rds2 and logo:
-        gen.set_logo_bits(load_logo_bits(logo))
 
     rds_bits = gen.generate_bits(int(math.ceil(total_seconds * RDS_BITRATE * 1.1)))
 
@@ -453,7 +602,6 @@ def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, 
 
     def producer():
         idx = 0
-        gain = db_to_linear(level_mpx)
         while idx < stereo.shape[0]:
             end = min(idx + blocksize, stereo.shape[0])
             left = stereo[idx:end, 0]
@@ -504,7 +652,7 @@ def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, 
     prod_thread = threading.Thread(target=producer, daemon=True)
     prod_thread.start()
 
-    with sd.OutputStream(channels=1, dtype='float32', callback=callback, blocksize=blocksize):
+    with sd.OutputStream(channels=1, dtype='float32', callback=callback, blocksize=blocksize, samplerate=fs):
         while prod_thread.is_alive():
             time.sleep(0.1)
 
