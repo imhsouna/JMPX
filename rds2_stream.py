@@ -438,6 +438,71 @@ def generate_tone(duration_s: float, fs: int, freq_hz: float = 1000.0, level_db:
     return np.stack([left, right], axis=1).astype(np.float32)
 
 
+class SystemLoopbackCapture:
+    """Capture system audio via WASAPI loopback on Windows, or default input elsewhere."""
+
+    def __init__(self, fs: int, device: Optional[int] = None, channels: int = 2, blocksize: int = 4096):
+        self.fs = fs
+        self.device = device
+        self.channels = channels
+        self.blocksize = blocksize
+        self.q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=16)
+        self._stream: Optional[sd.InputStream] = None
+
+    def start(self):
+        extra = None
+        if sys.platform.startswith('win'):
+            try:
+                extra = sd.WasapiSettings(loopback=True)
+            except Exception:
+                extra = None
+        def cb(indata, frames, time_info, status):
+            try:
+                # Ensure stereo
+                x = indata.copy()
+                if x.ndim == 1:
+                    x = np.stack([x, x], axis=1)
+                elif x.shape[1] == 1:
+                    x = np.repeat(x, 2, axis=1)
+                # Resample if not expected blocksize
+                self.q.put_nowait(x.astype(np.float32))
+            except queue.Full:
+                pass
+        self._stream = sd.InputStream(
+            samplerate=self.fs,
+            device=self.device,
+            channels=self.channels,
+            dtype='float32',
+            callback=cb,
+            blocksize=self.blocksize,
+            extra_settings=extra,
+        )
+        self._stream.start()
+
+    def read(self, frames: int) -> np.ndarray:
+        try:
+            buf = self.q.get(timeout=1.0)
+        except queue.Empty:
+            return np.zeros((frames, 2), dtype=np.float32)
+        # If frames mismatch, pad/trim
+        if buf.shape[0] < frames:
+            pad = np.zeros((frames - buf.shape[0], buf.shape[1]), dtype=buf.dtype)
+            buf = np.vstack([buf, pad])
+        elif buf.shape[0] > frames:
+            buf = buf[:frames, :]
+        return buf
+
+    def stop(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            finally:
+                self._stream = None
+        with self.q.mutex:
+            self.q.queue.clear()
+
+
 # =============================
 # CLI
 # =============================
@@ -482,64 +547,90 @@ def _prepare_rds_bits(pi: int, ps: str, rt: str, seconds: float, fs: int) -> np.
 @click.option("--logo", type=click.Path(exists=True, dir_okay=False), default=None, help="Path to station logo image (png/jpg)")
 @click.option("--level-mpx", type=float, default=0.0, show_default=True, help="Overall MPX gain (dB)")
 @click.option("--blocksize", type=int, default=4096, show_default=True, help="Block size for streaming frames")
+@click.option("--system-audio", is_flag=True, default=False, help="Capture system audio (WASAPI loopback on Windows)")
+@click.option("--capture-device", type=int, default=None, help="Capture device index for system audio (WASAPI output device)")
 def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, device: Optional[int], pi: str, ps: str,
-         rt: str, pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, logo: Optional[str], level_mpx: float, blocksize: int):
+         rt: str, pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, logo: Optional[str], level_mpx: float, blocksize: int,
+         system_audio: bool, capture_device: Optional[int]):
     """Play composite MPX with RDS/RDS2 to a sound device."""
-    if input is None and tone is None:
-        raise click.UsageError("Provide --input or --tone")
+    if not system_audio and input is None and tone is None:
+        raise click.UsageError("Provide --input or --tone or --system-audio")
 
     sd.default.samplerate = fs
     if device is not None:
         sd.default.device = device
 
-    if input:
+    cfg = RdsConfig(pi_code=int(pi, 16), program_service_name=ps or "", radiotext=rt or "")
+    gen = RdsBitstreamGenerator(cfg)
+    if rds2 and logo:
+        gen.set_logo_bits(load_logo_bits(logo))
+
+    # Prepare audio source
+    stereo: Optional[np.ndarray] = None
+    capture: Optional[SystemLoopbackCapture] = None
+    if system_audio:
+        capture = SystemLoopbackCapture(fs=fs, device=capture_device, channels=2, blocksize=blocksize)
+        capture.start()
+    elif input:
         stereo, _ = read_audio_file(input, target_fs=fs)
     else:
         stereo = generate_tone(duration_s=duration, fs=fs, freq_hz=tone or 1000.0)
 
-    total_seconds = stereo.shape[0] / fs
-    cfg = RdsConfig(pi_code=int(pi, 16), program_service_name=ps or "", radiotext=rt or "")
-    gen = RdsBitstreamGenerator(cfg)
-
-    if rds2 and logo:
-        gen.set_logo_bits(load_logo_bits(logo))
-
+    # Initial RDS bits
+    total_seconds = 2.0 if system_audio else (stereo.shape[0] / fs)
     rds_bits = gen.generate_bits(int(math.ceil(total_seconds * RDS_BITRATE * 1.1)))
 
-    # Streaming in blocks
     q_out: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
 
-    def producer():
+    def producer_from_array():
+        assert stereo is not None
         idx = 0
         gain = db_to_linear(level_mpx)
         while idx < stereo.shape[0]:
             end = min(idx + blocksize, stereo.shape[0])
             left = stereo[idx:end, 0]
             right = stereo[idx:end, 1]
-            # bits for this block (approx)
             bits_needed = int(math.ceil((end - idx) / fs * RDS_BITRATE)) + 208
             if len(rds_bits) < bits_needed:
-                # extend
                 extra = gen.generate_bits(int(math.ceil(2.0 * RDS_BITRATE)))
                 rds_bits[:] = np.concatenate([rds_bits, extra])
             bits_block = rds_bits[:bits_needed]
             rds_bits[:] = rds_bits[bits_needed:]
 
-            mpx = make_mpx(
-                left=left,
-                right=right,
-                fs=fs,
-                pilot_level=pilot_level,
-                rds_level=rds_level,
-                rds2_level=rds2_level,
-                rds_bits=bits_block,
-                enable_rds2=rds2,
-            )
+            mpx = make_mpx(left, right, fs, pilot_level, rds_level, rds2_level, bits_block, rds)
             mpx *= gain
             q_out.put(mpx, block=True)
             idx = end
-        # signal end
         q_out.put(None)
+
+    def producer_from_capture():
+        assert capture is not None
+        gain = db_to_linear(level_mpx)
+        while True:
+            buf = capture.read(blocksize)
+            left = buf[:, 0]
+            right = buf[:, 1]
+            bits_needed = int(math.ceil((len(left)) / fs * RDS_BITRATE)) + 208
+            if len(rds_bits) < bits_needed:
+                extra = gen.generate_bits(int(math.ceil(2.0 * RDS_BITRATE)))
+                rds_bits[:] = np.concatenate([rds_bits, extra])
+            bits_block = rds_bits[:bits_needed]
+            rds_bits[:] = rds_bits[bits_needed:]
+
+            mpx = make_mpx(left, right, fs, pilot_level, rds_level, rds2_level, bits_block, rds)
+            mpx *= gain
+            try:
+                q_out.put(mpx, timeout=1.0)
+            except queue.Full:
+                pass
+
+    # Choose producer
+    import threading
+    if system_audio:
+        prod_thread = threading.Thread(target=producer_from_capture, daemon=True)
+    else:
+        prod_thread = threading.Thread(target=producer_from_array, daemon=True)
+    prod_thread.start()
 
     def callback(outdata, frames, time_info, status):
         try:
@@ -549,7 +640,6 @@ def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, 
             return
         if chunk is None:
             raise sd.CallbackStop
-        # outdata is 2D (frames, channels). We output mono MPX to 1 ch; if device requires stereo, duplicate.
         if outdata.shape[1] == 1:
             outdata[:, 0] = chunk[:frames] if len(chunk) >= frames else np.pad(chunk, (0, frames - len(chunk)))
         else:
@@ -557,14 +647,13 @@ def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, 
             outdata[:, 0] = mono
             outdata[:, 1] = mono
 
-    # Run
-    import threading
-    prod_thread = threading.Thread(target=producer, daemon=True)
-    prod_thread.start()
-
-    with sd.OutputStream(channels=1, dtype='float32', callback=callback, blocksize=blocksize):
-        while prod_thread.is_alive():
-            time.sleep(0.1)
+    try:
+        with sd.OutputStream(channels=1, dtype='float32', callback=callback, blocksize=blocksize):
+            while prod_thread.is_alive():
+                time.sleep(0.1)
+    finally:
+        if capture is not None:
+            capture.stop()
 
 
 @cli.command()

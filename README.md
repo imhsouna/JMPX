@@ -34,6 +34,14 @@ python rds2_stream.py devices
 python rds2_stream.py play --device 3 --input my.wav --fs 192000 --pi 0x1234 --ps "STATION"
 ```
 
+- System-audio loopback (Windows WASAPI) with Virtual Audio Cable:
+```bash
+# Set Windows Default Playback to VAC-A so all apps play there.
+# Use VAC-B as MPX sink to your transmitter at 192000 Hz.
+python rds2_stream.py play --system-audio --capture-device <VAC-A-out-index> --device <VAC-B-out-index> \
+  --fs 192000 --pi 0x1234 --ps "MYRADIO" --rt "Welcome" --pilot-level 0.09 --rds-level 0.04 --rds2 --logo logo.png
+```
+
 ## Features
 
 - FM MPX generation: L+R baseband, 19 kHz pilot, L-R DSB-SC at 38 kHz
