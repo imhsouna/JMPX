@@ -20,6 +20,48 @@ except Exception:  # ImportError or other runtime issues
 from PIL import Image
 
 
+def list_devices(verbose: bool = False) -> str:
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+    lines = []
+    if not verbose:
+        lines.append("Index | Name | Max output channels")
+        for idx, d in enumerate(devices):
+            if d.get('max_output_channels', 0) > 0:
+                lines.append(f"{idx:5d} | {d['name']} | {d['max_output_channels']}")
+    else:
+        lines.append("Index | HostAPI | Name | InCh | OutCh | Default SR")
+        for idx, d in enumerate(devices):
+            hai = int(d.get('hostapi', 0))
+            ha = hostapis[hai]['name'] if 0 <= hai < len(hostapis) else str(hai)
+            lines.append(
+                f"{idx:5d} | {ha:7s} | {d['name'][:40]:40s} | {d.get('max_input_channels',0):4d} | {d.get('max_output_channels',0):5d} | {int(d.get('default_samplerate',0) or 0):7d}"
+            )
+    return "\n".join(lines)
+
+
+def find_device_index_by_name(name_substring: str, require_output: bool = True, prefer_hostapi: Optional[str] = 'WASAPI') -> Optional[int]:
+    name_l = name_substring.lower()
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+    candidates = []
+    for idx, d in enumerate(devices):
+        if name_l in d['name'].lower():
+            if require_output and d.get('max_output_channels', 0) <= 0:
+                continue
+            hai = int(d.get('hostapi', 0))
+            ha = hostapis[hai]['name'] if 0 <= hai < len(hostapis) else ''
+            score = 0
+            if prefer_hostapi and prefer_hostapi.lower() in ha.lower():
+                score += 10
+            score += int(d.get('max_output_channels', 0))
+            candidates.append((score, idx))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
 # =============================
 # Constants and utilities
 # =============================
@@ -497,25 +539,39 @@ class SystemLoopbackCapture:
             except queue.Full:
                 pass
 
+        channels_try = []
+        if dev_info is not None:
+            out_ch = int(dev_info.get('max_output_channels', 0) or 0)
+            if out_ch:
+                channels_try.extend([min(out_ch, 2), out_ch])
+        channels_try.extend([2, 1])
+        tried = set()
         for sr in sr_try:
-            try:
-                self._stream = sd.InputStream(
-                    samplerate=sr,
-                    device=self.device,
-                    channels=ch,
-                    dtype='float32',
-                    callback=cb,
-                    blocksize=self.blocksize,
-                    extra_settings=extra,
-                )
-                self._stream.start()
-                self.captured_fs = float(sr)
-                self.captured_channels = ch
-                opened = True
+            for ch_try in channels_try:
+                key = (sr, ch_try)
+                if key in tried:
+                    continue
+                tried.add(key)
+                try:
+                    self._stream = sd.InputStream(
+                        samplerate=sr,
+                        device=self.device,
+                        channels=ch_try,
+                        dtype='float32',
+                        callback=cb,
+                        blocksize=self.blocksize,
+                        extra_settings=extra,
+                    )
+                    self._stream.start()
+                    self.captured_fs = float(sr)
+                    self.captured_channels = ch_try
+                    opened = True
+                    break
+                except Exception as e:
+                    err_last = e
+                    self._stream = None
+            if opened:
                 break
-            except Exception as e:
-                err_last = e
-                self._stream = None
         if not opened:
             raise RuntimeError(f"Failed to open loopback input: {err_last}")
 
@@ -585,14 +641,11 @@ def cli():
 
 @cli.command()
 @click.option("--fs", type=int, default=192000, show_default=True, help="Sample rate for MPX output")
-def devices(fs: int):
-    """List audio output devices."""
+@click.option("--verbose", is_flag=True, default=False, help="Show host API, in/out channels, default SR")
+def devices(fs: int, verbose: bool):
+    """List audio output devices (add --verbose for host API details)."""
     sd.default.samplerate = fs
-    info = sd.query_devices()
-    click.echo("Index | Name | Max output channels")
-    for idx, dev in enumerate(info):
-        if dev.get("max_output_channels", 0) > 0:
-            click.echo(f"{idx:5d} | {dev['name']} | {dev['max_output_channels']}")
+    click.echo(list_devices(verbose=verbose))
 
 
 def _prepare_rds_bits(pi: int, ps: str, rt: str, seconds: float, fs: int) -> np.ndarray:
@@ -620,12 +673,26 @@ def _prepare_rds_bits(pi: int, ps: str, rt: str, seconds: float, fs: int) -> np.
 @click.option("--blocksize", type=int, default=4096, show_default=True, help="Block size for streaming frames")
 @click.option("--system-audio", is_flag=True, default=False, help="Capture system audio (WASAPI loopback on Windows)")
 @click.option("--capture-device", type=int, default=None, help="Capture device index for system audio (WASAPI output device)")
+@click.option("--capture-name", type=str, default=None, help="Capture device name substring (prefers WASAPI)")
+@click.option("--device-name", type=str, default=None, help="Output device name substring (prefers WASAPI)")
 def play(input: Optional[str], tone: Optional[float], duration: float, fs: int, device: Optional[int], pi: str, ps: str,
          rt: str, pilot_level: float, rds_level: float, rds2: bool, rds2_level: float, logo: Optional[str], level_mpx: float, blocksize: int,
-         system_audio: bool, capture_device: Optional[int]):
+         system_audio: bool, capture_device: Optional[int], capture_name: Optional[str], device_name: Optional[str]):
     """Play composite MPX with RDS/RDS2 to a sound device."""
     if not system_audio and input is None and tone is None:
         raise click.UsageError("Provide --input or --tone or --system-audio")
+
+    # Resolve by name if provided
+    if capture_name and capture_device is None:
+        idx = find_device_index_by_name(capture_name, require_output=True, prefer_hostapi='WASAPI')
+        if idx is None:
+            raise click.BadParameter(f"Capture device with name containing '{capture_name}' not found")
+        capture_device = idx
+    if device_name and device is None:
+        idx = find_device_index_by_name(device_name, require_output=True, prefer_hostapi='WASAPI')
+        if idx is None:
+            raise click.BadParameter(f"Output device with name containing '{device_name}' not found")
+        device = idx
 
     sd.default.samplerate = fs
     if device is not None:
