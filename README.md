@@ -1,41 +1,54 @@
-# JMPX v2
-A Stereo encoder for FM transmitters now with [RDS], [SCA] and [DSCA] support.
+# Python FM MPX + RDS/RDS2 Streaming CLI
 
-![Screenshot of JMPX on Linux](JMPX/images/screenshot-linux.png)
+Cross-platform (Windows/Linux) Python CLI that generates an FM composite (MPX) signal with stereo pilot, stereo DSB-SC subcarrier, RDS (57 kHz) and optional RDS2 subcarriers, and streams to a soundcard or writes a WAV file. Inspired by JMPX.
 
-This program can be used in conjunction with FM transmitters to produce stereo transmissions. This allows you to transmit your very own FM stereo signal which can be received with any standard FM stereo radio. The FM transmitter gets connected to the computer soundcard and JMPX takes care of the rest.
+Note: Transmitting RF may be illegal without a license. This tool outputs baseband MPX audio. Use responsibly.
 
-This program consists of a dynamically liked library and a GUI. The library performs the main work of obtaining audio and producing audio, and the GUI is just for control and looks. A soundcard that supports at least 96000Hz is needed for stereo operation and 192000Hz for RDS and/or SCA/DSCA operation.
+## Quickstart
 
-## Acknowledgments
+- Python 3.10+
+- Soundcard supporting 192 kHz (recommended) for proper RDS spectral placement
 
-Thanks to Radio Galileo (Galileo Soc. Coop.) 100.5Mhz in Terni Italy and Federico Allegretti for their funding to the development of RDS support for JMPX.
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+pip install -r requirements.txt
+python rds2_stream.py --help
+```
 
-## Compiling
+## Examples
 
-Qt and Qt Creator are recommended (If on Windows I recommended using the MinGW compiler and getting everything with [MSYS2](http://www.msys2.org/).
+- Play a stereo WAV and inject basic RDS PS/PI at 192 kHz to default output:
+```bash
+python rds2_stream.py play --input my_stereo.wav --fs 192000 --pi 0x1234 --ps "TESTFM" --rt "Hello world" --level-mpx -3
+```
 
-* Open [JMPX.pro](JMPX.pro) with Qt Creator and build
-* If on Windows copy [JMPX/libopus-1.2-alpha/bin/32/libopus-0.dll](JMPX/libopus-1.2-alpha/bin/32/libopus-0.dll) or [JMPX/libopus-1.2-alpha/bin/64/libopus-0.dll](JMPX/libopus-1.2-alpha/bin/64/libopus-0.dll) (depending if you are building a 32 bit or 64 bit version) to the build directory (alternatively you can build libopus yourself and copy the dll over).
-* Run JMPX
+- Generate a 1 kHz tone and write MPX WAV with RDS:
+```bash
+python rds2_stream.py tofile --output mpx.wav --duration 30 --tone 1000 --fs 192000 --pi 0x1234 --ps "TEST" --rt "Demo" --rds2
+```
 
-Alternatively typing `qmake && make && sudo make install` in the head directory will compile and install JMPX assuming all the things JMPX needs to compile exists on your system
+- List audio devices and pick one:
+```bash
+python rds2_stream.py devices
+python rds2_stream.py play --device 3 --input my.wav --fs 192000 --pi 0x1234 --ps "STATION"
+```
 
-## FM Transmitter
+## Features
 
-The transmitter needs to not have any low pass filter on its input from the soundcard. This is so the frequencies above 16kHz actually modulate the transmitter.
+- FM MPX generation: L+R baseband, 19 kHz pilot, L-R DSB-SC at 38 kHz
+- RDS (RBDS) at 57 kHz BPSK with CRC and differential encoding
+- Optional RDS2 sidebands (SCA at 66.5/76/85.5 kHz) experimental
+- Output to soundcard (real-time) or WAV file
+- CLI with Click
 
-For testing it is possible to use a simple one transistor FM transmitter design but signal quality and frequency stability are likely to be problems.
+## Limitations
 
-## SCA and DSCA
+- RDS2 implementation is experimental and may not be fully standard-compliant
+- Requires high sample rate (>= 192 kHz) for clean spectral placement
+- This produces MPX audio. RF transmission requires external hardware and legal authorization
 
-SCA is for transmitting another audio signal on top of the standard FM signal and is usually transmitted way up around 67.5K. DSCA is a digital equivalent to SCA and can be demodulated and decoded with [JDSCA].
+## License
 
-Jonti 2017
-http://jontio.zapto.org
-
-[DSCA]: http://jontio.zapto.org/hda1/jdsca.html
-[JDSCA]: https://github.com/jontio/JDSCA
-[SCA]: https://en.wikipedia.org/wiki/Subsidiary_communications_authority
-[RDS]: https://en.wikipedia.org/wiki/Radio_Data_System
+MIT
 

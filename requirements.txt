@@ -1,0 +1,8 @@
+numpy>=1.26
+scipy>=1.11
+sounddevice>=0.4
+soundfile>=0.12
+click>=8.1
+Pillow>=10.3
+Flask>=3.0
+waitress>=3.0
