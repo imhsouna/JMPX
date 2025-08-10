@@ -10,7 +10,13 @@ import click
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-from scipy.signal import resample_poly, firwin, lfilter
+# Optional SciPy (Windows Store Python sometimes hangs on import). We provide fallbacks.
+try:
+    from scipy.signal import resample_poly as sp_resample_poly, firwin as sp_firwin, lfilter as sp_lfilter
+except Exception:  # ImportError or other runtime issues
+    sp_resample_poly = None
+    sp_firwin = None
+    sp_lfilter = None
 from PIL import Image
 
 
@@ -53,6 +59,58 @@ def db_to_linear(db_value: float) -> float:
 
 def clamp_audio(signal: np.ndarray, peak: float = 0.999) -> np.ndarray:
     return np.clip(signal, -peak, peak)
+
+
+# =============================
+# SciPy-free fallbacks
+# =============================
+
+def safe_resample_poly(y: np.ndarray, up: int, down: int) -> np.ndarray:
+    if sp_resample_poly is not None:
+        return sp_resample_poly(y, up=up, down=down)
+    # Fallback: length-based linear interpolation
+    new_len = int(round(y.shape[0] * up / float(down)))
+    if new_len <= 1 or y.shape[0] <= 1:
+        return y
+    x = np.arange(y.shape[0], dtype=np.float64)
+    xi = np.linspace(0.0, float(y.shape[0] - 1), new_len)
+    if y.ndim == 1:
+        yi = np.interp(xi, x, y.astype(np.float64))
+        return yi.astype(y.dtype)
+    else:
+        # Resample per column
+        out = np.zeros((new_len, y.shape[1]), dtype=np.float64)
+        for ch in range(y.shape[1]):
+            out[:, ch] = np.interp(xi, x, y[:, ch].astype(np.float64))
+        return out.astype(y.dtype)
+
+
+def safe_firwin(numtaps: int, cutoff: float, fs: float) -> np.ndarray:
+    if sp_firwin is not None:
+        return sp_firwin(numtaps, cutoff=cutoff, fs=fs)
+    # Simple lowpass sinc with Hamming window
+    n = np.arange(numtaps) - (numtaps - 1) / 2.0
+    h = 2 * cutoff / fs * np.sinc(2 * cutoff / fs * n)
+    w = np.hamming(numtaps)
+    h *= w
+    h /= np.sum(h)
+    return h.astype(np.float64)
+
+
+def safe_lfilter(b: np.ndarray, a: List[float], x: np.ndarray, axis: int = 0) -> np.ndarray:
+    if sp_lfilter is not None:
+        return sp_lfilter(b, a, x, axis=axis)
+    # FIR-only fallback (a == [1.0]) via convolution, centered
+    if not (len(a) == 1 and abs(float(a[0]) - 1.0) < 1e-12):
+        raise RuntimeError("IIR filtering unsupported without SciPy")
+    if x.ndim == 1:
+        return np.convolve(x, b, mode='same')
+    # Move axis to last, convolve per vector
+    x_swap = np.moveaxis(x, axis, -1)
+    y = np.empty_like(x_swap)
+    for i in range(x_swap.shape[-1]):
+        y[..., i] = np.convolve(x_swap[..., i], b, mode='same')
+    return np.moveaxis(y, -1, axis)
 
 
 # =============================
@@ -293,7 +351,7 @@ def bpsk_subcarrier(bits: np.ndarray, fs: float, subcarrier_hz: float, bitrate: 
     shaped = np.convolve(base, h, mode='same')
     # If fractional, resample to exact fs
     if sps_eff != sps:
-        shaped = resample_poly(shaped, up=int(fs), down=int(bitrate * sps_eff))
+        shaped = safe_resample_poly(shaped, up=int(fs), down=int(bitrate * sps_eff))
         # The above is approximate and could be optimized; in practice, choose fs multiple of bitrate
     # Mix to subcarrier
     t = np.arange(len(shaped)) / fs
@@ -307,8 +365,8 @@ def bpsk_subcarrier(bits: np.ndarray, fs: float, subcarrier_hz: float, bitrate: 
 
 def lowpass_stereo(audio: np.ndarray, fs: float, cutoff_hz: float = 15000.0) -> np.ndarray:
     numtaps = 513
-    fir = firwin(numtaps, cutoff=cutoff_hz, fs=fs)
-    return lfilter(fir, [1.0], audio, axis=0)
+    fir = safe_firwin(numtaps, cutoff=cutoff_hz, fs=fs)
+    return safe_lfilter(fir, [1.0], audio, axis=0)
 
 
 def make_mpx(
@@ -365,8 +423,8 @@ def read_audio_file(path: str, target_fs: int) -> Tuple[np.ndarray, int]:
         data = np.repeat(data, 2, axis=1)
     if fs != target_fs:
         # Resample each channel
-        left = resample_poly(data[:, 0], up=target_fs, down=fs)
-        right = resample_poly(data[:, 1], up=target_fs, down=fs)
+        left = safe_resample_poly(data[:, 0], up=target_fs, down=fs)
+        right = safe_resample_poly(data[:, 1], up=target_fs, down=fs)
         data = np.stack([left, right], axis=1)
         fs = target_fs
     return data.astype(np.float32), fs
@@ -563,26 +621,24 @@ def tofile(output: str, input: Optional[str], tone: Optional[float], duration: f
 
 def load_logo_bits(path: str) -> np.ndarray:
     """Load an image and pack as a simple framed monochrome bitstream for RDS2.
-    Frame format (repeating):
-    - 8 bits magic (0xA7)
-    - 7 bits width (1..64)
-    - 6 bits height (1..32)
-    - 3 bits reserved (0)
-    - width*height bits, row-major, 1=white, 0=black
-    - 16 bits simple checksum (sum of payload bytes & 0xFFFF)
-    This is not an ETSI RDS2 logo standard; it's a practical, receiver-agnostic payload carried on RDS2 BPSK.
+    Handles transparency by compositing onto white, then converting to L.
     """
-    img = Image.open(path).convert('L')
+    img = Image.open(path)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.alpha_composite(img)
+        img = bg.convert("L")
+    else:
+        img = img.convert('L')
     w = min(RDS2_LOGO_MAX_W, max(1, img.width))
     h = min(RDS2_LOGO_MAX_H, max(1, img.height))
     if img.width != w or img.height != h:
         img = img.resize((w, h), Image.LANCZOS)
     arr = np.array(img)
-    # Binarize with Otsu-like threshold (simple mean)
     thr = float(arr.mean())
     bits = (arr >= thr).astype(np.uint8)
 
-    # Header bits
     header = []
     def put(val: int, nbits: int):
         for i in range(nbits - 1, -1, -1):
@@ -595,8 +651,6 @@ def load_logo_bits(path: str) -> np.ndarray:
 
     payload_bits = bits.flatten().tolist()
 
-    # Compute checksum over payload bytes
-    # Pack payload bits into bytes MSB-first
     payload_bytes = []
     acc = 0
     cnt = 0
@@ -612,10 +666,12 @@ def load_logo_bits(path: str) -> np.ndarray:
         payload_bytes.append(acc)
 
     checksum = sum(payload_bytes) & 0xFFFF
-    footer = []
-    put(checksum, 16)
+    def put_footer(val: int, nbits: int):
+        for i in range(nbits - 1, -1, -1):
+            header.append((val >> i) & 1)
+    put_footer(checksum, 16)
 
-    all_bits = np.array(header + payload_bits + footer, dtype=np.uint8)
+    all_bits = np.array(header + payload_bits, dtype=np.uint8)
     return all_bits
 
 
