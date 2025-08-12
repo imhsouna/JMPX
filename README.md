@@ -11,8 +11,14 @@ Note: Transmitting RF may be illegal without a license. This tool outputs baseba
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+python -m rds2 --help
+```
+
+Legacy entrypoint is still available:
+
+```bash
 python rds2_stream.py --help
 ```
 
@@ -20,18 +26,18 @@ python rds2_stream.py --help
 
 - Play a stereo WAV and inject basic RDS PS/PI at 192 kHz to default output:
 ```bash
-python rds2_stream.py play --input my_stereo.wav --fs 192000 --pi 0x1234 --ps "TESTFM" --rt "Hello world" --level-mpx -3
+python -m rds2 play --input my_stereo.wav --fs 192000 --pi 0x1234 --ps "TESTFM" --rt "Hello world" --level-mpx -3
 ```
 
 - Generate a 1 kHz tone and write MPX WAV with RDS:
 ```bash
-python rds2_stream.py tofile --output mpx.wav --duration 30 --tone 1000 --fs 192000 --pi 0x1234 --ps "TEST" --rt "Demo" --rds2
+python -m rds2 tofile --output mpx.wav --duration 30 --tone 1000 --fs 192000 --pi 0x1234 --ps "TEST" --rt "Demo" --rds2
 ```
 
 - List audio devices and pick one:
 ```bash
-python rds2_stream.py devices
-python rds2_stream.py play --device 3 --input my.wav --fs 192000 --pi 0x1234 --ps "STATION"
+python -m rds2 devices
+python -m rds2 play --device 3 --input my.wav --fs 192000 --pi 0x1234 --ps "STATION"
 ```
 
 ## Features
