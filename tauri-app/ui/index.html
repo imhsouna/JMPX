@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rustmpx</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #0b0c0e; color: #e5e7eb; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .row { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+    .card { background: linear-gradient(180deg, rgba(20,20,24,.9), rgba(14,14,18,.9)); border: 1px solid rgba(255,255,255,.06); border-radius: 12px; padding: 16px; }
+    .btn { border-radius: 8px; padding: 10px 14px; border: 1px solid rgba(255,255,255,.12); background: transparent; color: #e5e7eb; cursor: pointer; }
+    .btn.primary { border: none; background: linear-gradient(90deg,#22d3ee,#4ade80); color: #0b0c0e; font-weight: 600; }
+    input, select { width: 100%; background: transparent; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; padding: 8px 10px; color: #e5e7eb; }
+    label { display:block; font-size: 12px; color:#9aa0a6; margin-bottom: 6px; }
+  </style>
+  <script type="module">
+    import { invoke } from "https://esm.sh/@tauri-apps/api@2.0.0-rc.6/tauri"
+    window.addEventListener('DOMContentLoaded', async ()=>{
+      try {
+        const list = await invoke('list_devices');
+        const sel = document.getElementById('device');
+        list.forEach((n,i)=>{ const o=document.createElement('option'); o.value=i; o.textContent=n; sel.appendChild(o); });
+      } catch(e) { console.error(e) }
+      document.getElementById('start').addEventListener('click', async ()=>{
+        const cfg = {
+          fs: Number(document.getElementById('fs').value||'192000'),
+          pi_hex: document.getElementById('pi').value||'0x1234',
+          ps: document.getElementById('ps').value||'RADIO',
+          rt: document.getElementById('rt').value||'',
+          pilot: Number(document.getElementById('pilot').value||'0.08'),
+          rds: Number(document.getElementById('rds').value||'0.03'),
+          rds2: Number(document.getElementById('rds2').value||'0.01'),
+          enable_rds2: document.getElementById('rds2en').checked,
+        }
+        await invoke('start_stream', { cfg });
+        updateStatus();
+      });
+      document.getElementById('stop').addEventListener('click', async ()=>{
+        await invoke('stop_stream');
+        updateStatus();
+      });
+      async function updateStatus(){
+        try { const s = await invoke('status'); document.getElementById('status').textContent = s ? 'Streaming' : 'Idle'; } catch(e){}
+      }
+      setInterval(updateStatus, 1500);
+      updateStatus();
+    });
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    <h1 style="display:flex; align-items:center; gap:10px; font-size:18px; font-weight:600;">rustmpx <span id="status" style="font-size:12px; opacity:.7;">Idle</span></h1>
+    <div class="row">
+      <div class="card">
+        <h3 style="margin:0 0 12px 0;">Source & Output</h3>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div>
+            <label>Sample rate (Hz)</label>
+            <input id="fs" value="192000" />
+          </div>
+          <div>
+            <label>Output Device</label>
+            <select id="device"></select>
+          </div>
+        </div>
+        <div style="margin-top:14px; display:flex; gap:10px;">
+          <button id="start" class="btn primary">Start</button>
+          <button id="stop" class="btn">Stop</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="margin:0 0 12px 0;">RDS</h3>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div><label>PI</label><input id="pi" value="0x1234" /></div>
+          <div><label>PS</label><input id="ps" value="RADIO" /></div>
+          <div class="" style="grid-column: 1 / span 2;"><label>Radiotext</label><input id="rt" value="Welcome to RADIO" /></div>
+          <div><label>Pilot</label><input id="pilot" value="0.08" /></div>
+          <div><label>RDS</label><input id="rds" value="0.03" /></div>
+          <div><label>RDS2</label><input id="rds2" value="0.01" /></div>
+          <div><label><input type="checkbox" id="rds2en" checked /> Enable RDS2</label></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
