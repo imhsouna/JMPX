@@ -1,0 +1,11 @@
+[package]
+name = "rustmpx"
+version = "0.1.0"
+edition = "2021"
+authors = ["Cursor AI"]
+description = "FM MPX generator with RDS/RDS2 (from scratch Rust rewrite)"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+hound = "3.5.1"
