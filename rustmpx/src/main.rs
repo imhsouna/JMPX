@@ -18,6 +18,7 @@ use ringbuf::{HeapRb, Rb, Consumer, Producer};
 // Persistence
 #[cfg(feature = "web")]
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::Row;
 
 // Files & images
 use std::path::{Path, PathBuf};
@@ -429,10 +430,12 @@ enum SourceKind { Tone { freq: f64 }, File { path: String } }
 struct RuntimeState {
 	stop_flag: Arc<AtomicBool>,
 	bg_task: Option<JoinHandle<()>>,
+	current_cfg: Option<StreamConfig>,
+	started_at: Option<std::time::Instant>,
 }
 
 impl RuntimeState {
-	fn new() -> Self { Self { stop_flag: Arc::new(AtomicBool::new(false)), bg_task: None } }
+	fn new() -> Self { Self { stop_flag: Arc::new(AtomicBool::new(false)), bg_task: None, current_cfg: None, started_at: None } }
 }
 
 fn decode_audio_file(path: &str) -> anyhow::Result<(Vec<f32>, Vec<f32>, u32)> {
@@ -637,45 +640,135 @@ async fn stop_stream(state: Arc<Mutex<RuntimeState>>) {
 // ============ Web UI ============
 #[cfg(feature = "web")]
 static TEMPLATE: &str = r#"<!doctype html>
-<html>
+<html lang=\"en\">
 <head>
-	<meta charset=\"utf-8\" />
-	<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-	<script src=\"https://cdn.tailwindcss.com\"></script>
-	<title>FM MPX + RDS/RDS2</title>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <script src=\"https://cdn.tailwindcss.com\"></script>
+  <title>rustmpx — FM MPX + RDS/RDS2</title>
+  <style>
+    :root { color-scheme: dark; }
+    .card { background: linear-gradient(180deg, rgba(18, 18, 21, 0.9), rgba(14, 14, 18, 0.9)); border: 1px solid rgba(255,255,255,0.06); }
+    .btn-primary { background: linear-gradient(90deg,#22d3ee,#4ade80); }
+    .btn-primary:hover { filter: brightness(1.05); }
+    .chip { border: 1px solid rgba(255,255,255,0.08); }
+    .grid-form label { color: #9aa0a6; font-size: 0.85rem; }
+    .dropzone { border: 1px dashed rgba(255,255,255,0.15); }
+  </style>
 </head>
-<body class=\"bg-slate-50 text-slate-800\">
-	<div class=\"max-w-5xl mx-auto p-6\">
-		<h1 class=\"text-2xl font-bold mb-4\">FM MPX + RDS/RDS2 Web UI</h1>
-		<form class=\"grid grid-cols-1 md:grid-cols-2 gap-4\" method=\"post\" enctype=\"multipart/form-data\" action=\"/start\">
-			<div class=\"space-y-3 p-4 bg-white rounded shadow\">
-				<h2 class=\"font-semibold\">Audio Source</h2>
-				<div><label class=\"block text-sm\">Sample Rate (Hz)</label><input class=\"border rounded px-2 py-1 w-full\" type=\"number\" name=\"fs\" value=\"192000\" /></div>
-				<div><label class=\"inline-flex items-center gap-2\"><input type=\"radio\" name=\"source\" value=\"tone\" checked /> Tone</label><label class=\"inline-flex items-center gap-2 ml-4\"><input type=\"radio\" name=\"source\" value=\"file\" /> File</label></div>
-				<div id=\"toneRow\"><label class=\"block text-sm\">Tone (Hz)</label><input class=\"border rounded px-2 py-1 w-full\" type=\"number\" step=\"1\" name=\"tone\" value=\"1000\" /><label class=\"block text-sm mt-2\">Duration (s)</label><input class=\"border rounded px-2 py-1 w-full\" type=\"number\" step=\"1\" name=\"duration\" value=\"60\" /></div>
-				<div id=\"fileRow\" class=\"hidden\"><label class=\"block text-sm\">Upload audio file</label><input class=\"border rounded px-2 py-1 w-full\" type=\"file\" name=\"audio\" accept=\"audio/*\" /></div>
-				<div><label class=\"block text-sm\">Output Device</label><select class=\"border rounded px-2 py-1 w-full\" name=\"device\"><option value=\"\">Default</option></select></div>
+<body class=\"bg-black text-white min-h-screen\">
+  <div class=\"max-w-6xl mx-auto px-6 py-6\">
+	<header class=\"flex items-center justify-between mb-6\">
+	  <div class=\"flex items-center gap-3\">
+		<div class=\"h-9 w-9 rounded bg-gradient-to-br from-cyan-400 to-emerald-400\"></div>
+		<h1 class=\"text-xl font-semibold tracking-tight\">rustmpx</h1>
+	  </div>
+	  <div id=\"statusChip\" class=\"chip px-3 py-1 rounded text-sm text-gray-300\">Idle</div>
+	</header>
+
+	<div class=\"grid grid-cols-1 lg:grid-cols-3 gap-6\">
+	  <section class=\"lg:col-span-2 card rounded-xl p-5\">
+		<h2 class=\"text-lg font-medium mb-4\">Source & Output</h2>
+		<form id=\"controlForm\" class=\"grid grid-cols-1 md:grid-cols-2 gap-4 grid-form\" enctype=\"multipart/form-data\">
+		  <div>
+			<label>Sample Rate (Hz)</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" type=\"number\" name=\"fs\" value=\"192000\" />
+		  </div>
+		  <div>
+			<label>Output Device</label>
+			<select id=\"deviceSelect\" class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" name=\"device\"></select>
+		  </div>
+		  <div class=\"md:col-span-2\">
+			<div class=\"flex items-center gap-6\">
+			  <label class=\"inline-flex items-center gap-2\"><input type=\"radio\" name=\"source\" value=\"tone\" checked /> Tone</label>
+			  <label class=\"inline-flex items-center gap-2\"><input type=\"radio\" name=\"source\" value=\"file\" /> File</label>
 			</div>
-			<div class=\"space-y-3 p-4 bg-white rounded shadow\">
-				<h2 class=\"font-semibold\">RDS / RDS2</h2>
-				<div class=\"grid grid-cols-2 gap-2\"><div><label class=\"block text-sm\">PI (hex)</label><input class=\"border rounded px-2 py-1 w-full\" name=\"pi\" value=\"0x1234\" /></div><div><label class=\"block text-sm\">PS (name)</label><input class=\"border rounded px-2 py-1 w-full\" name=\"ps\" value=\"RADIO\" /></div></div>
-				<div><label class=\"block text-sm\">Radiotext</label><input class=\"border rounded px-2 py-1 w-full\" name=\"rt\" value=\"Welcome to RADIO\" /></div>
-				<div class=\"grid grid-cols-3 gap-2\"><div><label class=\"block text-sm\">Pilot level</label><input class=\"border rounded px-2 py-1 w-full\" name=\"pilot\" value=\"0.08\" /></div><div><label class=\"block text-sm\">RDS level</label><input class=\"border rounded px-2 py-1 w-full\" name=\"rds\" value=\"0.03\" /></div><div><label class=\"block text-sm\">RDS2 level</label><input class=\"border rounded px-2 py-1 w-full\" name=\"rds2\" value=\"0.01\" /></div></div>
-				<div><label class=\"inline-flex items-center gap-2\"><input type=\"checkbox\" name=\"enable_rds2\" checked /> Enable RDS2</label></div>
-				<div><label class=\"block text-sm\">Upload Logo (png/jpg)</label><input class=\"border rounded px-2 py-1 w-full\" type=\"file\" name=\"logo\" accept=\"image/*\" /></div>
-			</div>
-			<div class=\"md:col-span-2 flex items-center gap-3\"><button class=\"bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded\" type=\"submit\">Start</button><a class=\"bg-gray-200 hover:bg-gray-300 px-4 py-2 rounded\" href=\"/stop\">Stop</a><span id=\"status\" class=\"ml-2 text-sm\"></span></div>
+		  </div>
+		  <div id=\"toneFields\">
+			<label>Tone Frequency (Hz)</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" type=\"number\" name=\"tone\" value=\"1000\" />
+			<label class=\"mt-3\">Duration (s)</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" type=\"number\" name=\"duration\" value=\"60\" />
+		  </div>
+		  <div id=\"fileFields\" class=\"hidden\">
+			<label>Audio File</label>
+			<div id=\"dropzone\" class=\"dropzone mt-1 rounded px-4 py-6 text-sm text-gray-300 flex items-center justify-center\">Drop audio here or click to browse</div>
+			<input id=\"audioInput\" class=\"hidden\" type=\"file\" name=\"audio\" accept=\"audio/*\" />
+		  </div>
+		  <div class=\"md:col-span-2 flex items-center gap-3 mt-2\">
+			<button id=\"startBtn\" class=\"btn-primary px-4 py-2 rounded text-black font-medium\" type=\"submit\">Start</button>
+			<button id=\"stopBtn\" class=\"px-4 py-2 rounded border border-white/10\" type=\"button\">Stop</button>
+		  </div>
 		</form>
+	  </section>
+
+	  <section class=\"card rounded-xl p-5\">
+		<h2 class=\"text-lg font-medium mb-4\">RDS / RDS2</h2>
+		<form id=\"rdsForm\" class=\"grid grid-cols-2 gap-4 grid-form\">
+		  <div>
+			<label>PI (hex)</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" name=\"pi\" value=\"0x1234\" />
+		  </div>
+		  <div>
+			<label>PS (name)</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" name=\"ps\" value=\"RADIO\" />
+		  </div>
+		  <div class=\"col-span-2\">
+			<label>Radiotext</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" name=\"rt\" value=\"Welcome to RADIO\" />
+		  </div>
+		  <div>
+			<label>Pilot</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" name=\"pilot\" value=\"0.08\" />
+		  </div>
+		  <div>
+			<label>RDS</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" name=\"rds\" value=\"0.03\" />
+		  </div>
+		  <div>
+			<label>RDS2</label>
+			<input class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" name=\"rds2\" value=\"0.01\" />
+		  </div>
+		  <div class=\"col-span-2\">
+			<label class=\"inline-flex items-center gap-2\"><input type=\"checkbox\" name=\"enable_rds2\" checked /> Enable RDS2</label>
+		  </div>
+		  <div class=\"col-span-2\">
+			<label>Logo (auto-fit 64x32)</label>
+			<input id=\"logoInput\" class=\"mt-1 w-full bg-transparent border rounded px-3 py-2 border-white/10\" type=\"file\" name=\"logo\" accept=\"image/*\" />
+			<canvas id=\"logoPreview\" class=\"mt-2 rounded bg-white/5 w-full h-24\"></canvas>
+		  </div>
+		</form>
+	  </section>
 	</div>
-	<script>
-	async function loadDevices(){ const r = await fetch('/devices'); const j = await r.json(); const sel = document.querySelector('select[name=device]'); j.forEach(d=>{ const o=document.createElement('option'); o.value=d.index; o.textContent=d.index+' - '+d.name; sel.appendChild(o); }); }
-	const sourceRadios = document.querySelectorAll('input[name=source]');
-	const toneRow = document.getElementById('toneRow');
-	const fileRow = document.getElementById('fileRow');
-	function updateSource(){ const v = document.querySelector('input[name=source]:checked').value; toneRow.classList.toggle('hidden', v!=='tone'); fileRow.classList.toggle('hidden', v!=='file'); }
-	sourceRadios.forEach(r=>r.addEventListener('change', updateSource));
-	updateSource(); loadDevices();
-	</script>
+
+	<section class=\"mt-6 card rounded-xl p-5\">
+	  <h2 class=\"text-lg font-medium mb-3\">Activity</h2>
+	  <pre id=\"log\" class=\"text-xs text-gray-300 whitespace-pre-wrap\"></pre>
+	</section>
+  </div>
+
+  <script>
+    async function fetchJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+    async function refreshDevices(){ try { const list = await fetchJSON('/devices'); const sel = document.getElementById('deviceSelect'); sel.innerHTML = '<option value="">Default</option>'; list.forEach(d=>{ const o=document.createElement('option'); o.value=d.index; o.textContent=`${d.index} · ${d.name} (${d.channels}ch)`; sel.appendChild(o); }); } catch(e){ console.warn(e); } }
+    async function refreshStatus(){ try { const st = await fetchJSON('/status'); const chip = document.getElementById('statusChip'); chip.textContent = st.streaming ? `Streaming · ${st.fs} Hz` : 'Idle'; chip.className = 'chip px-3 py-1 rounded text-sm ' + (st.streaming ? 'text-emerald-300' : 'text-gray-300'); } catch(e){} }
+    async function refreshConfig(){ try { const c = await fetchJSON('/config'); if(!c) return; document.querySelector('input[name=\"fs\"]').value=c.fs||192000; document.querySelector('input[name=\"pi\"]').value=c.pi_hex||'0x1234'; document.querySelector('input[name=\"ps\"]').value=c.ps||''; document.querySelector('input[name=\"rt\"]').value=c.rt||''; document.querySelector('input[name=\"pilot\"]').value=c.pilot||0.08; document.querySelector('input[name=\"rds\"]').value=c.rds||0.03; document.querySelector('input[name=\"rds2\"]').value=c.rds2||0.01; if(c.enable_rds2){ document.querySelector('input[name=\"enable_rds2\"]').checked=true; } } catch(e){} }
+
+    function hookSourceToggle(){ const radios = document.querySelectorAll('input[name=source]'); const tone = document.getElementById('toneFields'); const file = document.getElementById('fileFields'); const update = ()=>{ const v = document.querySelector('input[name=source]:checked').value; tone.classList.toggle('hidden', v!=='tone'); file.classList.toggle('hidden', v!=='file'); }; radios.forEach(r=>r.addEventListener('change', update)); update(); }
+
+    function setupDropzone(){ const dz=document.getElementById('dropzone'); const inp=document.getElementById('audioInput'); dz.addEventListener('click',()=>inp.click()); dz.addEventListener('dragover',(e)=>{ e.preventDefault(); dz.classList.add('border-cyan-400');}); dz.addEventListener('dragleave',()=>dz.classList.remove('border-cyan-400')); dz.addEventListener('drop',(e)=>{ e.preventDefault(); dz.classList.remove('border-cyan-400'); if(e.dataTransfer.files.length){ inp.files=e.dataTransfer.files; dz.textContent=e.dataTransfer.files[0].name; } }); inp.addEventListener('change',()=>{ if(inp.files.length){ dz.textContent=inp.files[0].name; } }); }
+
+    function setupLogoPreview(){ const inp=document.getElementById('logoInput'); const canvas=document.getElementById('logoPreview'); const ctx=canvas.getContext('2d'); canvas.width=512; canvas.height=96; inp.addEventListener('change',()=>{ const f=inp.files[0]; if(!f) return; const img=new Image(); img.onload=()=>{ const w=img.width,h=img.height; const scale=Math.min(canvas.width*0.9/w, canvas.height*0.9/h); const nw=w*scale, nh=h*scale; ctx.clearRect(0,0,canvas.width,canvas.height); ctx.globalAlpha=0.3; ctx.fillStyle='#0a0a0a'; ctx.fillRect(0,0,canvas.width,canvas.height); ctx.globalAlpha=1.0; ctx.drawImage(img,(canvas.width-nw)/2,(canvas.height-nh)/2,nw,nh); }; img.src=URL.createObjectURL(f); }); }
+
+    async function startStreaming(){ const cf=document.getElementById('controlForm'); const rf=document.getElementById('rdsForm'); const fd=new FormData(cf); new FormData(rf).forEach((v,k)=>fd.append(k,v)); const r=await fetch('/start',{ method:'POST', body:fd }); if(r.redirected){ window.location=r.url; } }
+    async function stopStreaming(){ await fetch('/stop'); }
+
+    document.getElementById('controlForm').addEventListener('submit', async (e)=>{ e.preventDefault(); try{ await startStreaming(); }catch(err){ console.error(err);} finally{ setTimeout(refreshStatus,500); }});
+    document.getElementById('stopBtn').addEventListener('click', async ()=>{ await stopStreaming(); setTimeout(refreshStatus,200); });
+
+    hookSourceToggle(); setupDropzone(); setupLogoPreview();
+    refreshDevices(); refreshConfig(); refreshStatus();
+    setInterval(refreshStatus, 2000);
+  </script>
 </body>
 </html>"#;
 
@@ -688,6 +781,39 @@ async fn index_handler() -> Html<&'static str> { Html(TEMPLATE) }
 
 #[cfg(feature = "web")]
 async fn devices_handler() -> Json<Vec<OutputDeviceInfo>> { Json(list_output_devices()) }
+
+#[cfg(feature = "web")]
+#[derive(Serialize)]
+struct Status { streaming: bool, fs: Option<u32>, since_ms: Option<u128> }
+
+#[cfg(feature = "web")]
+async fn status_handler(State(ctx): State<AppContext>) -> Json<Status> {
+	let st = ctx.state.lock().unwrap();
+	let streaming = st.bg_task.is_some();
+	let fs = st.current_cfg.as_ref().map(|c| c.fs);
+	let since_ms = st.started_at.map(|t| t.elapsed().as_millis());
+	Json(Status { streaming, fs, since_ms })
+}
+
+#[cfg(feature = "web")]
+#[derive(Serialize)]
+struct SavedConfig { fs: u32, pi_hex: String, ps: String, rt: String, pilot: f64, rds: f64, rds2: f64, enable_rds2: bool }
+
+#[cfg(feature = "web")]
+async fn config_handler(State(ctx): State<AppContext>) -> Json<Option<SavedConfig>> {
+	if let Ok(row) = sqlx::query("SELECT fs, pi, ps, rt, pilot, rds, rds2, enable_rds2 FROM config WHERE id=1").fetch_one(&ctx.pool).await {
+		let fs: i64 = row.get::<i64, _>("fs");
+		let pi: i64 = row.get::<i64, _>("pi");
+		let ps: String = row.try_get::<String, _>("ps").unwrap_or_default();
+		let rt: String = row.try_get::<String, _>("rt").unwrap_or_default();
+		let pilot: f64 = row.try_get::<f64, _>("pilot").unwrap_or(0.08);
+		let rds: f64 = row.try_get::<f64, _>("rds").unwrap_or(0.03);
+		let rds2: f64 = row.try_get::<f64, _>("rds2").unwrap_or(0.01);
+		let enable_rds2: i64 = row.try_get::<i64, _>("enable_rds2").unwrap_or(1);
+		return Json(Some(SavedConfig { fs: fs as u32, pi_hex: format!("0x{:04X}", pi as u16), ps, rt, pilot, rds, rds2, enable_rds2: enable_rds2 != 0 }));
+	}
+	Json(None)
+}
 
 #[cfg(feature = "web")]
 async fn start_handler(State(ctx): State<AppContext>, mut multipart: Multipart) -> Result<Redirect, String> {
@@ -749,7 +875,7 @@ async fn start_handler(State(ctx): State<AppContext>, mut multipart: Multipart) 
 		.execute(&ctx.pool).await;
 	// Stop any existing stream then start
 	stop_stream(ctx.state.clone()).await;
-	{ let mut s = ctx.state.lock().unwrap(); s.stop_flag.store(false, Ordering::SeqCst); s.bg_task = None; }
+	{ let mut s = ctx.state.lock().unwrap(); s.stop_flag.store(false, Ordering::SeqCst); s.bg_task = None; s.current_cfg = Some(cfg.clone()); s.started_at = Some(std::time::Instant::now()); }
 	start_stream(cfg, ctx.state.clone()).await.map_err(|e| e.to_string())?;
 	Ok(Redirect::to("/"))
 }
@@ -767,6 +893,8 @@ async fn run_server(port: u16, upload_dir: PathBuf) -> anyhow::Result<()> {
 	let app = Router::new()
 		.route("/", get(index_handler))
 		.route("/devices", get(devices_handler))
+		.route("/status", get(status_handler))
+		.route("/config", get(config_handler))
 		.route("/start", post(start_handler))
 		.route("/stop", get(stop_handler))
 		.with_state(ctx);
