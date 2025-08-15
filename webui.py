@@ -10,7 +10,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from rds2_stream import (
+from rds2 import (
     RdsConfig,
     RdsBitstreamGenerator,
     make_mpx,
@@ -19,6 +19,7 @@ from rds2_stream import (
     db_to_linear,
     RDS_BITRATE,
 )
+from rds2.logo import load_logo_bits
 
 TEMPLATE = """
 <!doctype html>
@@ -166,7 +167,6 @@ def run_stream(fs: int, device: Optional[int], audio_path: Optional[str], tone: 
     cfg = RdsConfig(pi_code=int(pi_hex, 16), program_service_name=ps or '', radiotext=rt or '')
     gen = RdsBitstreamGenerator(cfg)
     if enable_rds2 and logo_path:
-        from rds2_stream import load_logo_bits
         gen.set_logo_bits(load_logo_bits(logo_path))
 
     total_seconds = stereo.shape[0] / fs
@@ -220,7 +220,6 @@ def start():
     device = int(device) if device else None
     source = request.form.get('source', 'tone')
 
-    # Store uploads in tmp folder
     workdir = os.path.join(app.root_path, 'uploads')
     os.makedirs(workdir, exist_ok=True)
 
