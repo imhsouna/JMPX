@@ -1,0 +1,1 @@
+fn(Multipart, State<AppContext>) -> impl Future<Output = Result<Redirect, std::string::String>> {start_handler}
